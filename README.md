@@ -165,6 +165,7 @@ normal case, not the exception.
 | `firewall` | restrict 11434 to the local subnet (`ufw` or `targeted`) |
 | `model` | pull the base model sized to this board's RAM |
 | `slobo` | render the Modelfile, `ollama create slobo` |
+| `beacon` | mDNS + a boot/timer beacon so the node announces itself |
 | `verify` | real Macedonian prompt; prints cold load time and tok/s |
 
 `slobo/Modelfile.tmpl` holds the Macedonian system prompt (identity, Cyrillic,
@@ -211,11 +212,24 @@ asks before erasing anything.
 - [`../inference-node`](../inference-node) — the earlier SSH-driven bootstrap
   aimed at one specific LAN host
 
+## Finding a node
+
+Node addresses come from DHCP and they move — `192.168.100.155` became
+`192.168.100.77` when the board went onto a USB ethernet adapter. The `beacon`
+phase makes a node announce itself instead, over two channels: mDNS
+(`<hostname>.local`, needs nothing running on the other end) and an HTTP push
+carrying full state to a collector. See [`beacon/README.md`](beacon/README.md).
+
+```bash
+ssh orangepi@orangepi5.local          # mDNS: no IP needed, ever
+./beacon/collector.py --list          # what has checked in, and when
+```
+
 ## Deployed nodes
 
 | Node | Hardware | Model | Speed |
 |---|---|---|---|
-| `192.168.100.155` | Orange Pi 5, RK3588S, 16 GB, 512 GB NVMe | `slobo` / `qwen3:8b` Q4_K_M, 16K ctx | 3.63 tok/s |
+| `orangepi5.local` | Orange Pi 5, RK3588S, 16 GB, 512 GB NVMe | `slobo` / `qwen3:8b` Q4_K_M, 16K ctx | 3.63 tok/s |
 
 Deployed with `--nvme /dev/nvme0n1 --firewall-mode targeted`, since that board
 also runs microk8s, tailscale, and a Nextcloud data directory on the NVMe.

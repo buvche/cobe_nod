@@ -1,0 +1,14 @@
+[Unit]
+Description=cobe-nod beacon schedule
+
+[Timer]
+# On boot: announce as soon as the network settles. That is the case that
+# matters — a node that just took a new DHCP lease.
+OnBootSec=30s
+# Then keep the record fresh so a stale entry is visibly stale.
+OnUnitActiveSec=5min
+AccuracySec=10s
+Unit=cobe-beacon.service
+
+[Install]
+WantedBy=timers.target

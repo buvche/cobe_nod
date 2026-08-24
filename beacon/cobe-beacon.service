@@ -1,0 +1,14 @@
+[Unit]
+Description=cobe-nod beacon — announce this node to the collector
+Wants=network-online.target
+After=network-online.target ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cobe-nod/cobe-beacon.sh
+# The beacon must never wedge boot or the timer: it exits 0 even when the
+# collector is down, and this is the backstop if it ever hangs on curl.
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

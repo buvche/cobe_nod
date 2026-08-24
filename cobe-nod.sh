@@ -58,6 +58,7 @@
 #   firewall   ufw rule scoped to the local subnet
 #   model      pick a base model for this RAM and pull it
 #   slobo      render the Modelfile and `ollama create slobo`
+#   beacon     announce this node to the collector on boot and on a timer
 #   verify     real Macedonian round-trip; prints load time and tok/s
 #   all        every phase above, in order
 #
@@ -78,6 +79,11 @@
 #                    rules that restrict ONLY the Ollama port and leave global
 #                    policy alone — right for a box already running other
 #                    services (k8s, tailscale) that default-deny would break.
+#   --beacon-url U   collector endpoint this node announces itself to, e.g.
+#                    http://192.168.100.65:9977/beacon. Without it the beacon
+#                    phase still installs mDNS, so the node stays findable by
+#                    <hostname>.local even when its DHCP address moves.
+#   --no-beacon      skip the beacon phase
 #   --no-firewall    skip the firewall phase entirely (only if something else
 #                    is already filtering this port for you)
 #   -h | --help
@@ -98,6 +104,8 @@ ASSUME_YES=0
 DO_FIREWALL=1
 DO_FORMAT=0
 FIREWALL_MODE="ufw"
+BEACON_URL=""
+DO_BEACON=1
 
 SERVICE_NAME="ollama"
 OVERRIDE_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
@@ -310,6 +318,7 @@ phase_deps() {
   need_root
   export DEBIAN_FRONTEND=noninteractive
   local want=(curl ca-certificates jq lsb-release)
+  (( DO_BEACON )) && want+=(avahi-daemon avahi-utils)
   if (( DO_FIREWALL )); then
     case "$FIREWALL_MODE" in
       ufw)      want+=(ufw) ;;
@@ -609,6 +618,53 @@ phase_slobo() {
 }
 
 # --------------------------------------------------------------------------
+# phase: beacon
+# --------------------------------------------------------------------------
+# A node whose address is handed out by DHCP will eventually move, and then it
+# is simply lost until someone sweeps the subnet. This node announces itself
+# instead: an HTTP push carrying full state, plus mDNS so it stays resolvable
+# as <hostname>.local even with no collector running at all.
+phase_beacon() {
+  step "beacon"
+  if (( ! DO_BEACON )); then
+    warn "skipped by --no-beacon — this node will not announce itself"
+    return 0
+  fi
+  need_root
+
+  # mDNS: the channel that needs no infrastructure on the other end.
+  if systemctl list-unit-files avahi-daemon.service >/dev/null 2>&1; then
+    systemctl enable --now avahi-daemon >/dev/null 2>&1 || true
+    ok "mDNS active — reachable as $(hostname).local regardless of DHCP"
+  else
+    warn "avahi-daemon not installed; mDNS channel unavailable (run deps)"
+  fi
+
+  install -D -m 0755 "${SCRIPT_DIR}/beacon/cobe-beacon.sh" /opt/cobe-nod/cobe-beacon.sh \
+    || die "beacon/cobe-beacon.sh not found next to this script"
+
+  mkdir -p /etc/cobe-nod
+  if [[ -n "$BEACON_URL" ]]; then
+    printf 'BEACON_URL=%q\nOLLAMA_PORT=%q\n' "$BEACON_URL" "$PORT" > /etc/cobe-nod/beacon.conf
+    ok "collector: $BEACON_URL"
+  else
+    printf 'OLLAMA_PORT=%q\n' "$PORT" > /etc/cobe-nod/beacon.conf
+    warn "no --beacon-url given; mDNS only, no state is pushed anywhere"
+  fi
+
+  install -m 0644 "${SCRIPT_DIR}/beacon/cobe-beacon.service" /etc/systemd/system/
+  install -m 0644 "${SCRIPT_DIR}/beacon/cobe-beacon.timer"   /etc/systemd/system/
+  systemctl daemon-reload
+  systemctl enable --now cobe-beacon.timer >/dev/null 2>&1
+  ok "cobe-beacon.timer enabled (30s after boot, then every 5 min)"
+
+  systemctl start cobe-beacon.service 2>/dev/null || true
+  local out
+  out="$(journalctl -u cobe-beacon.service -n 3 --no-pager -o cat 2>/dev/null | tail -2)"
+  [[ -n "$out" ]] && sed 's/^/       /' <<<"$out"
+}
+
+# --------------------------------------------------------------------------
 # phase: verify
 # --------------------------------------------------------------------------
 # Not a smoke test of the HTTP layer — a real Macedonian prompt through the
@@ -680,7 +736,7 @@ phase_verify() {
 main() {
   while (( $# )); do
     case "$1" in
-      detect|deps|storage|ollama|firewall|model|slobo|verify|all) PHASE="$1" ;;
+      detect|deps|storage|ollama|firewall|model|slobo|beacon|verify|all) PHASE="$1" ;;
       --model)       FORCE_MODEL="$2"; shift ;;
       --nvme)        NVME_DEV="$2"; shift ;;
       --models-dir)  MODELS_DIR="$2"; shift ;;
@@ -690,6 +746,8 @@ main() {
       --yes|-y)      ASSUME_YES=1 ;;
       --format)      DO_FORMAT=1 ;;
       --firewall-mode) FIREWALL_MODE="$2"; shift ;;
+      --beacon-url)  BEACON_URL="$2"; shift ;;
+      --no-beacon)   DO_BEACON=0 ;;
       --no-firewall) DO_FIREWALL=0 ;;
       -h|--help)     usage ;;
       *) die "unknown argument: $1 (try --help)" ;;
@@ -708,6 +766,7 @@ main() {
     firewall) detect_net; phase_firewall ;;
     model)    detect_hardware; pick_model; phase_model ;;
     slobo)    detect_hardware; pick_model; phase_slobo ;;
+    beacon)   detect_hardware; detect_net; phase_beacon ;;
     verify)   detect_hardware; detect_net; phase_verify ;;
     all)
       phase_detect
@@ -717,6 +776,7 @@ main() {
       phase_firewall
       phase_model
       phase_slobo
+      phase_beacon
       phase_verify
       step "done"
       ok "node is live — ${BASE_MODEL} as 'slobo' on ${NODE_IP}:${PORT}"
