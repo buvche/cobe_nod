@@ -36,7 +36,13 @@
 #   --user NAME      login user on the node, default the current $USER
 #   --key PATH       ssh public key to authorize, default the first ~/.ssh/*.pub
 #   --model NAME     force the base model instead of sizing it to the Pi's RAM
-#   --nvme DEV       ERASE this device on the node and use it as the model store
+#   --nvme DEV       use this device on the node as the model store. An
+#                    existing filesystem is ADOPTED, not erased.
+#   --format         only with --nvme: erase that device on first boot.
+#                    DESTRUCTIVE and unattended — be sure the disk is blank.
+#   --firewall-mode M  'ufw' (default, right for a dedicated node) or
+#                    'targeted' (restrict only port 11434, for a node that
+#                    already runs other services)
 #   --wifi 'S:P'     wifi SSID and passphrase (omit for ethernet DHCP)
 #   --out PATH       output image path
 #   --write DEV      write the finished image to a block device (asks first)
@@ -53,6 +59,8 @@ NODE_USER="${SUDO_USER:-$USER}"
 SSH_KEY=""
 FORCE_MODEL=""
 NVME_DEV=""
+DO_FORMAT=0
+FIREWALL_MODE=""
 WIFI=""
 OUT=""
 WRITE_DEV=""
@@ -96,6 +104,8 @@ parse_args() {
       --key)      SSH_KEY="$2"; shift ;;
       --model)    FORCE_MODEL="$2"; shift ;;
       --nvme)     NVME_DEV="$2"; shift ;;
+      --format)   DO_FORMAT=1 ;;
+      --firewall-mode) FIREWALL_MODE="$2"; shift ;;
       --wifi)     WIFI="$2"; shift ;;
       --out)      OUT="$2"; shift ;;
       --write)    WRITE_DEV="$2"; shift ;;
@@ -105,6 +115,7 @@ parse_args() {
     esac
     shift
   done
+  (( DO_FORMAT )) && [[ -z "$NVME_DEV" ]] && die "--format needs --nvme DEV"
   [[ -n "$OUT" ]] || OUT="${SCRIPT_DIR}/out/cobe-nod-${BOARD}-$(date +%Y%m%d).img"
 }
 
@@ -177,14 +188,17 @@ fetch_image() {
 # --------------------------------------------------------------------------
 render_user_data() {
   local dest="$1"
-  local key script_b64 tmpl_b64 nvme_args model_args
+  local key script_b64 tmpl_b64 nvme_args model_args fw_args
   key="$(cat "$SSH_KEY")"
   script_b64="$(base64 -w0 < "${SCRIPT_DIR}/cobe-nod.sh")"
   tmpl_b64="$(base64 -w0 < "${SCRIPT_DIR}/slobo/Modelfile.tmpl")"
   nvme_args=""
   [[ -n "$NVME_DEV" ]] && nvme_args=" --nvme ${NVME_DEV}"
+  (( DO_FORMAT )) && nvme_args+=" --format"
   model_args=""
   [[ -n "$FORCE_MODEL" ]] && model_args=" --model ${FORCE_MODEL}"
+  fw_args=""
+  [[ -n "$FIREWALL_MODE" ]] && fw_args=" --firewall-mode ${FIREWALL_MODE}"
 
   cat > "$dest" <<CLOUD_EOF
 #cloud-config
@@ -240,7 +254,7 @@ write_files:
         ip -4 route get 1.1.1.1 >/dev/null 2>&1 && break
         sleep 5
       done
-      /opt/cobe-nod/cobe-nod.sh all --yes${nvme_args}${model_args} 2>&1 | tee -a "\$LOG"
+      /opt/cobe-nod/cobe-nod.sh all --yes${nvme_args}${model_args}${fw_args} 2>&1 | tee -a "\$LOG"
       date -Is > "\$STAMP"
       echo "cobe-nod deployed" | tee -a "\$LOG"
 
@@ -398,7 +412,11 @@ report() {
   echo "  When it is up, from this box:"
   echo "    curl http://${NODE_HOSTNAME}.local:11434/api/tags"
   echo
-  [[ -n "$NVME_DEV" ]] && warn "first boot will ERASE ${NVME_DEV} on the node and use it as the model store"
+  if (( DO_FORMAT )); then
+    warn "first boot will ERASE ${NVME_DEV} on the node — unattended, no prompt"
+  elif [[ -n "$NVME_DEV" ]]; then
+    echo "  ${DIM}First boot adopts ${NVME_DEV} as the model store; existing data is kept.${R}"
+  fi
   echo "  ${DIM}Port 11434 is unauthenticated by design. It is firewalled to the${R}"
   echo "  ${DIM}node's own subnet. Never forward it on the router.${R}"
 }

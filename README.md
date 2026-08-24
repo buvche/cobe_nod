@@ -98,7 +98,10 @@ on first boot and retries on failure.
 --user NAME      login user on the node, default $USER
 --key PATH       ssh public key, default the first ~/.ssh/*.pub
 --model NAME     force the base model instead of sizing it to RAM
---nvme DEV       ERASE this device on the node and use it as the model store
+--nvme DEV       use this device as the model store; an existing filesystem
+                 is ADOPTED, not erased
+--format         only with --nvme: erase that device on first boot (unattended)
+--firewall-mode  'ufw' (default) or 'targeted' — see Security below
 --wifi 'S:P'     wifi SSID and passphrase (omit for ethernet DHCP)
 --out PATH       output image path
 --write DEV      flash to a block device (asks twice)
@@ -128,13 +131,18 @@ sudo ./cobe-nod.sh all --nvme /dev/nvme0n1
 sudo ./cobe-nod.sh detect          # reports only, changes nothing
 ```
 
+`--nvme` **adopts** whatever filesystem is already on the disk — it mounts it
+and puts models in a `cobe-nod/models` subdirectory. Erasing is a separate,
+explicit `--format`, never implied. A disk with someone's data on it is the
+normal case, not the exception.
+
 | Phase | Does |
 |---|---|
 | `detect` | board, arch, RAM, storage, subnet; prints the plan. Read-only. |
-| `deps` | `curl jq ufw` (+ `parted gdisk` only when `--nvme` is given) |
-| `storage` | partition/format/mount the NVMe as the model store |
+| `deps` | `curl jq` + the firewall tooling (`parted gdisk` only with `--format`) |
+| `storage` | mount the NVMe as the model store — adopting any filesystem already on it |
 | `ollama` | install Ollama + hardened systemd override |
-| `firewall` | ufw: 11434 open to the local subnet only |
+| `firewall` | restrict 11434 to the local subnet (`ufw` or `targeted`) |
 | `model` | pull the base model sized to this board's RAM |
 | `slobo` | render the Modelfile, `ollama create slobo` |
 | `verify` | real Macedonian prompt; prints cold load time and tok/s |
@@ -150,10 +158,20 @@ the grammar rules that keep it off Serbian). `FROM`, `num_ctx`, and
 **Ollama has no authentication.** Anything that reaches port 11434 can run
 inference, list models, and pull or delete them.
 
-The node binds `0.0.0.0` so the main box can reach it, and ufw then scopes
-11434 to the node's own subnet, derived from its own interface. **Bind and
-firewall are a pair — keep both.** Remove the ufw rule and you have published
+The node binds `0.0.0.0` so the main box can reach it, and the firewall then
+scopes 11434 to the node's own subnet, derived from its own interface. **Bind
+and firewall are a pair — keep both.** Remove the rule and you have published
 an unauthenticated LLM endpoint to every network that board ever joins.
+
+Two ways to enforce it, because the right answer depends on what else the box
+does:
+
+- **`ufw`** (default) — enables ufw with default-deny incoming. Correct for a
+  dedicated node, e.g. one built from the SD image.
+- **`targeted`** — inserts an iptables chain that filters *only* port 11434 and
+  leaves global policy untouched. Use this on a box already running other
+  services: default-deny would cut off a k8s cluster or a tailnet. The `ufw`
+  mode detects listening k8s/tailscale ports and asks before enabling.
 
 Never port-forward 11434 on the router. Never enable UPnP for it.
 

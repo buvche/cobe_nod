@@ -63,14 +63,23 @@
 #
 # Options:
 #   --model NAME     force a base model instead of sizing it to RAM
-#   --nvme DEV       format DEV (e.g. /dev/nvme0n1) and mount it as the model
-#                    store. DESTRUCTIVE. Requires --yes in non-interactive runs.
+#   --nvme DEV       use DEV (e.g. /dev/nvme0n1) as the model store. If it
+#                    already holds a filesystem it is ADOPTED — mounted, and
+#                    models go in a subdirectory. Nothing is erased.
+#   --format         only with --nvme: erase the device first. DESTRUCTIVE.
+#                    Refuses to run unattended without --yes.
 #   --models-dir P   use an existing path as the model store (no formatting)
 #   --port N         Ollama port, default 11434
 #   --subnet CIDR    override the auto-derived firewall subnet
 #   --ctx N          force context window instead of sizing it to RAM
 #   --yes            assume yes; required for unattended/cloud-init runs
-#   --no-firewall    skip the ufw phase (only if something else firewalls you)
+#   --firewall-mode M  'ufw' (default) enables ufw with default-deny incoming —
+#                    right for a dedicated node. 'targeted' inserts iptables
+#                    rules that restrict ONLY the Ollama port and leave global
+#                    policy alone — right for a box already running other
+#                    services (k8s, tailscale) that default-deny would break.
+#   --no-firewall    skip the firewall phase entirely (only if something else
+#                    is already filtering this port for you)
 #   -h | --help
 #
 set -euo pipefail
@@ -87,6 +96,8 @@ SUBNET=""
 FORCE_CTX=""
 ASSUME_YES=0
 DO_FIREWALL=1
+DO_FORMAT=0
+FIREWALL_MODE="ufw"
 
 SERVICE_NAME="ollama"
 OVERRIDE_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
@@ -135,6 +146,24 @@ confirm() {
 
 need_root() {
   [[ "$(id -u)" == "0" ]] || die "this phase needs root — re-run with sudo"
+}
+
+# Phases are meant to be runnable one at a time, so the model store chosen by
+# the storage phase has to outlive that process — otherwise a later standalone
+# `ollama` phase silently falls back to the boot media.
+MODELS_DIR_STATE="${STATE_DIR}/models-dir"
+
+save_models_dir() {
+  [[ -n "$MODELS_DIR" ]] || return 0
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$MODELS_DIR" > "$MODELS_DIR_STATE"
+}
+
+load_models_dir() {
+  [[ -z "$MODELS_DIR" ]] || return 0
+  [[ -r "$MODELS_DIR_STATE" ]] || return 0
+  MODELS_DIR="$(cat "$MODELS_DIR_STATE")"
+  [[ -n "$MODELS_DIR" ]] && info "model store from previous run: $MODELS_DIR"
 }
 
 # --------------------------------------------------------------------------
@@ -251,8 +280,8 @@ phase_detect() {
     sed 's/^/       /' <<<"$nvme_found"
     if ! findmnt -no TARGET --source "/dev/$(awk 'NR==1{print $1}' <<<"$nvme_found")" >/dev/null 2>&1 \
        && [[ -z "$MODELS_DIR" && -z "$NVME_DEV" ]]; then
-      warn "NVMe is not mounted — models would land on the SD card"
-      warn "pass --nvme /dev/nvme0n1 to format and use it, or --models-dir PATH"
+      warn "NVMe is not mounted — models would land on the boot media"
+      warn "pass --nvme /dev/nvme0n1 to adopt it (existing data is kept)"
     fi
   else
     warn "no NVMe found — the model store will sit on the boot media"
@@ -264,7 +293,7 @@ phase_detect() {
   printf "  %-16s %s\n" "threads" "$THREADS"
   printf "  %-16s %s\n" "model store" "${MODELS_DIR:-$DEFAULT_MODELS_DIR}"
   printf "  %-16s %s\n" "listen" "0.0.0.0:${PORT}"
-  printf "  %-16s %s\n" "firewall" "$( (( DO_FIREWALL )) && echo "allow ${SUBNET:-<unknown>} -> ${PORT}" || echo "SKIPPED (--no-firewall)" )"
+  printf "  %-16s %s\n" "firewall" "$( (( DO_FIREWALL )) && echo "${FIREWALL_MODE}: allow ${SUBNET:-<unknown>} -> ${PORT}" || echo "SKIPPED (--no-firewall)" )"
 
   if [[ "$BASE_MODEL" == qwen3.8:27b || "$BASE_MODEL" =~ 27b|32b|70b ]]; then
     warn "${BASE_MODEL} is far larger than this board's RAM. It will page off"
@@ -281,9 +310,14 @@ phase_deps() {
   need_root
   export DEBIAN_FRONTEND=noninteractive
   local want=(curl ca-certificates jq lsb-release)
-  (( DO_FIREWALL )) && want+=(ufw)
-  # only needed when we are going to prepare the NVMe ourselves
-  [[ -n "$NVME_DEV" ]] && want+=(parted gdisk e2fsprogs)
+  if (( DO_FIREWALL )); then
+    case "$FIREWALL_MODE" in
+      ufw)      want+=(ufw) ;;
+      targeted) want+=(iptables iptables-persistent) ;;
+    esac
+  fi
+  # only needed when we are going to repartition something ourselves
+  (( DO_FORMAT )) && want+=(parted gdisk e2fsprogs)
 
   local missing=()
   for p in "${want[@]}"; do
@@ -314,6 +348,7 @@ phase_storage() {
 
   if [[ -n "$MODELS_DIR" ]]; then
     mkdir -p "$MODELS_DIR"
+    save_models_dir
     ok "using existing path as model store: $MODELS_DIR"
     return 0
   fi
@@ -325,28 +360,43 @@ phase_storage() {
     src="$(findmnt -no SOURCE --target "$MODELS_DIR")"
     warn "no --nvme given; model store stays on ${src} ($MODELS_DIR)"
     warn "on SD-card boot media this wears the card and loads models slowly"
+    save_models_dir
     return 0
   fi
 
   [[ -b "$NVME_DEV" ]] || die "$NVME_DEV is not a block device"
 
-  # Already prepared by an earlier run? Then this is a no-op, as promised.
-  local part="${NVME_DEV}p1"
-  [[ -b "$part" ]] || part="${NVME_DEV}1"
-  if [[ -b "$part" ]] && blkid -o value -s LABEL "$part" 2>/dev/null | grep -qx "cobe-nod"; then
-    ok "$part is already a cobe-nod store — mounting, not formatting"
+  # Which partition are we actually talking about? The whole device may itself
+  # carry a filesystem, or the data may be in the first partition.
+  local part=""
+  if [[ -n "$(blkid -o value -s TYPE "$NVME_DEV" 2>/dev/null)" ]]; then
+    part="$NVME_DEV"
   else
+    for cand in "${NVME_DEV}p1" "${NVME_DEV}1"; do
+      [[ -b "$cand" ]] && { part="$cand"; break; }
+    done
+  fi
+
+  local existing_fs=""
+  [[ -n "$part" ]] && existing_fs="$(blkid -o value -s TYPE "$part" 2>/dev/null || true)"
+
+  if (( DO_FORMAT )); then
+    # -------------------------------------------------------------------
+    # explicit erase — the only destructive path in this script
+    # -------------------------------------------------------------------
     echo
-    warn "about to ERASE ${NVME_DEV} and everything on it:"
+    warn "--format given: about to ERASE ${NVME_DEV} and everything on it:"
     lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT "$NVME_DEV" | sed 's/^/       /'
+    if [[ -n "$existing_fs" ]]; then
+      warn "${part} currently holds a ${existing_fs} filesystem with data on it."
+      warn "Dropping --format would keep that data and just use free space."
+    fi
     echo
-    confirm "erase ${NVME_DEV} and make it the model store?" \
+    confirm "erase ${NVME_DEV}? this cannot be undone" \
       || die "aborted by operator — nothing was changed"
 
-    for m in $(findmnt -rno TARGET --source "$NVME_DEV" 2>/dev/null || true); do
-      info "unmounting $m"; umount "$m"
-    done
-    for p in "${NVME_DEV}"p* "${NVME_DEV}"[0-9]*; do
+    local m
+    for p in "$NVME_DEV" "${NVME_DEV}"p* "${NVME_DEV}"[0-9]*; do
       [[ -b "$p" ]] || continue
       for m in $(findmnt -rno TARGET --source "$p" 2>/dev/null || true); do
         info "unmounting $m"; umount "$m"
@@ -361,19 +411,37 @@ phase_storage() {
     info "formatting $part ext4"
     mkfs.ext4 -q -L cobe-nod -m 0 "$part"
     ok "formatted $part"
+
+  elif [[ -n "$existing_fs" ]]; then
+    # -------------------------------------------------------------------
+    # adopt — the default. Someone else's data lives here; we are a guest.
+    # -------------------------------------------------------------------
+    ok "adopting existing ${existing_fs} filesystem on ${part} — nothing erased"
+  else
+    die "${NVME_DEV} has no filesystem. Pass --format to partition and format it."
   fi
 
-  local mnt="/var/lib/cobe-nod/store"
-  mkdir -p "$mnt"
-  local uuid; uuid="$(blkid -o value -s UUID "$part")"
-  if ! grep -q "$uuid" /etc/fstab; then
-    echo "UUID=${uuid} ${mnt} ext4 defaults,noatime,nofail 0 2" >> /etc/fstab
-    ok "added $part to /etc/fstab (noatime,nofail)"
+  # Mount it (wherever it already is, or at a stable path of our own).
+  local mnt
+  mnt="$(findmnt -fno TARGET --source "$part" 2>/dev/null || true)"
+  if [[ -n "$mnt" ]]; then
+    ok "already mounted at $mnt"
+  else
+    mnt="/mnt/nvme"
+    mkdir -p "$mnt"
+    local uuid; uuid="$(blkid -o value -s UUID "$part")"
+    if ! grep -q "$uuid" /etc/fstab; then
+      # nofail: a missing disk must never keep this node from booting.
+      echo "UUID=${uuid} ${mnt} ext4 defaults,noatime,nofail 0 2" >> /etc/fstab
+      ok "added ${part} to /etc/fstab as ${mnt} (noatime,nofail)"
+    fi
+    mount "$mnt"
+    ok "mounted ${part} at ${mnt}"
   fi
-  findmnt -no TARGET --source "$part" >/dev/null 2>&1 || mount "$mnt"
 
-  MODELS_DIR="${mnt}/models"
+  MODELS_DIR="${mnt}/cobe-nod/models"
   mkdir -p "$MODELS_DIR"
+  save_models_dir
   ok "model store: $MODELS_DIR ($(df -h "$mnt" | awk 'NR==2{print $4}') free)"
 }
 
@@ -395,8 +463,10 @@ phase_ollama() {
     ok "installed $(ollama --version 2>&1 | head -1)"
   fi
 
+  load_models_dir
   [[ -n "$MODELS_DIR" ]] || MODELS_DIR="$DEFAULT_MODELS_DIR"
   mkdir -p "$MODELS_DIR"
+  save_models_dir
   chown -R ollama:ollama "$MODELS_DIR" 2>/dev/null || true
 
   mkdir -p "$OVERRIDE_DIR"
@@ -446,7 +516,7 @@ phase_ollama() {
 # phase: firewall
 # --------------------------------------------------------------------------
 phase_firewall() {
-  step "firewall"
+  step "firewall (${FIREWALL_MODE})"
   if (( ! DO_FIREWALL )); then
     warn "skipped by --no-firewall — port ${PORT} is open to every network"
     warn "this board joins. Only acceptable if something else is filtering it."
@@ -454,14 +524,51 @@ phase_firewall() {
   fi
   need_root
   [[ -n "$SUBNET" ]] || die "could not derive the local subnet — pass --subnet CIDR"
-  command -v ufw >/dev/null 2>&1 || die "ufw not installed — run the deps phase"
 
-  # Never lock ourselves out of SSH.
-  ufw allow 22/tcp >/dev/null
-  ufw allow from "$SUBNET" to any port "$PORT" proto tcp >/dev/null
-  ufw --force enable >/dev/null
-  ok "ufw: 11434 reachable from ${SUBNET} only; 22 open; everything else denied"
-  ufw status numbered | sed 's/^/       /'
+  case "$FIREWALL_MODE" in
+    ufw)
+      command -v ufw >/dev/null 2>&1 || die "ufw not installed — run the deps phase"
+      if [[ -n "$(ss -lntp 2>/dev/null | grep -E ':(16443|6443|41641)\b' || true)" ]]; then
+        warn "this box is serving k8s and/or tailscale ports. Enabling ufw with"
+        warn "default-deny incoming can cut them off. --firewall-mode targeted"
+        warn "restricts only port ${PORT} and leaves global policy alone."
+        confirm "enable ufw anyway?" || die "aborted — no firewall change made"
+      fi
+      ufw allow 22/tcp >/dev/null            # never lock ourselves out of ssh
+      ufw allow from "$SUBNET" to any port "$PORT" proto tcp >/dev/null
+      ufw --force enable >/dev/null
+      ok "ufw: ${PORT} reachable from ${SUBNET} only; 22 open; rest denied"
+      ufw status numbered | sed 's/^/       /'
+      ;;
+
+    targeted)
+      # Restrict one port without touching the default policy, so whatever else
+      # this box already does keeps working. Loopback is exempted explicitly:
+      # 127.0.0.1 is not inside the LAN subnet, so the DROP rule would
+      # otherwise cut off the node's own client and every local health check.
+      command -v iptables >/dev/null 2>&1 || die "iptables not installed — run the deps phase"
+      local chain="COBE_NOD"
+      iptables -N "$chain" 2>/dev/null || iptables -F "$chain"
+      iptables -A "$chain" -i lo -j ACCEPT
+      iptables -A "$chain" -s "$SUBNET" -j ACCEPT
+      iptables -A "$chain" -j DROP
+      # jump into it exactly once, however many times this phase re-runs
+      iptables -C INPUT -p tcp --dport "$PORT" -j "$chain" 2>/dev/null \
+        || iptables -I INPUT 1 -p tcp --dport "$PORT" -j "$chain"
+      ok "iptables chain ${chain}: port ${PORT} accepts lo + ${SUBNET}, drops the rest"
+
+      if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 \
+          && ok "rules saved — they survive reboot" \
+          || warn "could not persist rules; they are lost on reboot"
+      else
+        warn "iptables-persistent not installed — rules are lost on reboot"
+      fi
+      iptables -L "$chain" -n --line-numbers | sed 's/^/       /'
+      ;;
+
+    *) die "unknown --firewall-mode: ${FIREWALL_MODE} (want 'ufw' or 'targeted')" ;;
+  esac
 }
 
 # --------------------------------------------------------------------------
@@ -581,6 +688,8 @@ main() {
       --subnet)      SUBNET="$2"; shift ;;
       --ctx)         FORCE_CTX="$2"; shift ;;
       --yes|-y)      ASSUME_YES=1 ;;
+      --format)      DO_FORMAT=1 ;;
+      --firewall-mode) FIREWALL_MODE="$2"; shift ;;
       --no-firewall) DO_FIREWALL=0 ;;
       -h|--help)     usage ;;
       *) die "unknown argument: $1 (try --help)" ;;
