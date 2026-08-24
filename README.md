@@ -56,8 +56,28 @@ not expose that backend anyway. Route whole requests, don't split tensors.
 | ≥ 3.5 GB | `qwen3:1.7b` | ~1.4 GB | 4096 |
 | below | `qwen3:0.6b` | | 4096 |
 
-The 16 GB Orange Pi 5 therefore gets **`qwen3:8b` at 16K context**. Real tok/s
-is whatever `./cobe-nod.sh verify` measures on your board — it prints cold load
+The 16 GB Orange Pi 5 therefore gets **`qwen3:8b` at 16K context**. Measured on
+one (RK3588S, 16 GB, Ubuntu 22.04, active cooling):
+
+| | |
+|---|---|
+| Sustained generation | **3.63 tok/s** |
+| Load when resident | 0.0 s (`OLLAMA_KEEP_ALIVE=-1`) |
+| Cold load from NVMe | ~66 s, once per boot |
+| Idle / under load | 39°C / 84–85°C SoC, 88–90°C big cores |
+
+Under sustained load the SoC plateaus at the 85°C trip point and the governor
+throttles to hold it: `cpu6-7` drop from 2208 MHz to 1608–2016 MHz while
+`cpu4-5` mostly hold 2352 MHz. That is the thermal design limit, not a fault —
+but it does mean **cooling directly buys tok/s** on this board.
+
+**Cooling is not optional.** Before an active cooler was fitted, this exact
+workload hard-reset the board three times, each reset sooner than the last,
+until it stopped coming back without a power cycle. With cooling it runs a full
+minute of generation at a stable 85°C. If you deploy to an RK3588 board, fit a
+heatsink and a fan first.
+
+Real tok/s is whatever `./cobe-nod.sh verify` measures on your board — it prints cold load
 time and sustained generation speed and writes them to
 `/var/lib/cobe-nod/node.json`. Trust that number over any estimate, including
 one in this README. Override with `--model` if you want to trade quality for
@@ -190,3 +210,15 @@ asks before erasing anything.
   harness that gates deploys
 - [`../inference-node`](../inference-node) — the earlier SSH-driven bootstrap
   aimed at one specific LAN host
+
+## Deployed nodes
+
+| Node | Hardware | Model | Speed |
+|---|---|---|---|
+| `192.168.100.155` | Orange Pi 5, RK3588S, 16 GB, 512 GB NVMe | `slobo` / `qwen3:8b` Q4_K_M, 16K ctx | 3.63 tok/s |
+
+Deployed with `--nvme /dev/nvme0n1 --firewall-mode targeted`, since that board
+also runs microk8s, tailscale, and a Nextcloud data directory on the NVMe.
+`/var/log` there is on zram, so journald was pointed at persistent storage on
+the NVMe — otherwise every crash erases its own evidence, which is exactly what
+happened during the pre-cooling resets.
