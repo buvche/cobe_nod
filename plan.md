@@ -1,14 +1,16 @@
 # cobe_nod — state and the 27B question
 
-*2026-08-24. The node at 192.168.100.155 is powered off (DJI battery pack died).
-Nothing in this file was run against the board today; every figure marked
-**measured** was captured before power was lost.*
+*2026-08-24. The node is **up** at `orangepi5.local` (currently 192.168.100.77;
+it was 192.168.100.155 until the board moved onto a USB ethernet adapter — new
+MAC, new DHCP lease). Address it by name, not by IP: the `beacon` phase
+publishes mDNS precisely so a moved lease cannot lose the node again. Every
+figure marked **measured** was captured on the board.*
 
 ---
 
 ## 1. Current state
 
-### Deployed and working (before power loss)
+### Deployed and working
 
 | Item | State | Source |
 |---|---|---|
@@ -22,6 +24,9 @@ Nothing in this file was run against the board today; every figure marked
 | Firewall | iptables chain `COBE_NOD`: 11434 accepts lo + 192.168.100.0/24, drops rest; persisted via iptables-persistent. Deliberately **not** ufw — the box runs microk8s + tailscaled and default-deny would break both | deployed |
 | NVMe | Adopted, never formatted. Pre-existing: nextcloud dir (6.0 G) + backup (346 M). Models under `/mnt/nvme/cobe-nod/models` | deployed |
 | Logging | journald persistent, bind-mounted to `/mnt/nvme/cobe-nod/journal` (`/var/log` is zram — volatile; crashes were erasing their own evidence) | deployed |
+| Beacon | mDNS via avahi (`orangepi5.local`) + `cobe-beacon.timer` pushing full state to a collector 30 s after boot and every 5 min | deployed |
+| Network | now on a USB ethernet adapter `enx1cbfce640211` (MAC `1c:bf:ce:64:02:11`), not the onboard NIC — this is why the address moved | measured |
+| Extra model | `qwen3:0.6b` (522 MB) left in place deliberately as a fast triage/classification path — pulled by the aborted sweep, kept on purpose | deployed |
 
 ### Measured performance (qwen3:8b Q4_K_M)
 
@@ -51,16 +56,19 @@ suspect, not the proven sole cause.
 ## 2. Next actions on boot
 
 1. **Power the board from a real 5 V/4 A USB-C PD supply**, not a battery pack.
-2. **Recover the interrupted benchmark sweep.** `~/diag/sweep.sh` was running
-   when power died; partial results are in `~/diag/sweep.csv` and
-   `~/diag/sweep.log` in the home dir (persistent — they survived). The sweep
-   covered qwen3:0.6b / 1.7b / 4b / 8b / 14b and qwen3.8:27b, prompt
-   "Каде е Македонија?", think:false, num_predict 64. **First action: read that
-   CSV** — whatever rows completed are real data.
-3. Verify the deploy came back clean: `systemctl status ollama`, `iptables -L
-   COBE_NOD`, journald still persistent on NVMe, model still resident after
-   warmup.
-4. Re-run any sweep rows the CSV shows as missing, now on stable power.
+2. ~~Recover the interrupted benchmark sweep.~~ **Done — and there was nothing
+   to recover.** `~/diag/sweep.csv` contains only its header row. Power died at
+   03:36:30 during generation on the first model (`qwen3:0.6b`), immediately
+   after its pull completed. **No sweep data exists.** The 0.6b model itself is
+   still on the node and is being kept for triage work.
+3. ~~Verify the deploy came back clean.~~ **Done.** Ollama enabled+active, NVMe
+   remounted via the `nofail` fstab entry, `COBE_NOD` iptables rules persisted,
+   models intact. The deploy survives reboots correctly.
+4. **Re-run the sweep from scratch on stable power.** `~/diag/sweep.sh` is still
+   on the node: qwen3:0.6b / 1.7b / 4b / 8b / 14b and qwen3.8:27b, prompt
+   "Каде е Македонија?", `think:false`, `num_predict 64`. Expect the 27b row to
+   fail or thrash — see §3; that failure is itself the data point.
+5. **Open the collector port** so the HTTP beacon channel works (see §5).
 
 ---
 
@@ -180,8 +188,14 @@ point, not a deployment.
 ## 5. Open items
 
 - [ ] **20 W USB-C PD supply** for the Pi (5 V/4 A) — before any further
-      stability or thermal conclusions.
-- [ ] **Recover `~/diag/sweep.csv`** on next boot; re-run missing rows.
+      stability or thermal conclusions. Still the top item.
+- [x] ~~Recover `~/diag/sweep.csv`~~ — recovered, and it holds only a header
+      row. No sweep data survived; the run must start over (§2.4).
+- [ ] **Open the beacon collector port.** The node builds and sends a correct
+      payload, but Windows Firewall drops inbound to the WSL2 collector — the
+      node can ping the host and not reach port 9977. One elevated PowerShell
+      rule fixes it; see [`beacon/README.md`](beacon/README.md). Until then
+      mDNS covers *finding* the node and only the pushed state is missing.
 - [ ] **Isolate the reset cause**: rerun the sustained-load test on mains
       power with cooling — only then attribute the pre-cooling resets.
 - [ ] **GUI question** (user plugged in a wireless mouse): not started. The

@@ -231,6 +231,9 @@ ssh orangepi@orangepi5.local          # mDNS: no IP needed, ever
 |---|---|---|---|
 | `orangepi5.local` | Orange Pi 5, RK3588S, 16 GB, 512 GB NVMe | `slobo` / `qwen3:8b` Q4_K_M, 16K ctx | 3.63 tok/s |
 
+`qwen3:0.6b` is also kept on that node as a fast path for triage and
+classification — the work that should never wake a larger model at all.
+
 Deployed with `--nvme /dev/nvme0n1 --firewall-mode targeted`, since that board
 also runs microk8s, tailscale, and a Nextcloud data directory on the NVMe.
 `/var/log` there is on zram, so journald was pointed at persistent storage on
